@@ -16,15 +16,28 @@ const initialItems = [
   { code: 'ST0001', description: 'TMT Steel Reinforcement Fe500', unit: 'kg', quantity: 100, materials: [['steel', 1.05], ['wire', 0.01]], labour: [['bar-bender', 0.012], ['helper', 0.012]], machinery: [] },
   { code: 'PL0001', description: '12mm Cement Plaster 1:4', unit: 'sq.m', quantity: 100, materials: [['cement', 0.12], ['sand', 0.016]], labour: [['mason', 0.15], ['helper', 0.2]], machinery: [] },
 ];
-const standardRecipes = initialItems.map((item) => ({ ...item, aliases: item.description.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 2) }));
+const standardRecipes = [
+  ...initialItems,
+  { ...initialItems[0], code: 'RC0002', description: 'Plain RCC Concrete 1:2:4', aliases: ['plain', 'rcc', 'concrete', '1:2:4'] },
+  { ...initialItems[0], code: 'RC0003', description: 'RCC Concrete M25', aliases: ['rcc', 'concrete', 'm25'] },
+  { ...initialItems[1], code: 'ST0002', description: 'TMT Steel Fe500D Reinforcement', aliases: ['tmt', 'steel', 'fe500d', 'reinforcement'] },
+  { ...initialItems[2], code: 'PL0002', description: '15mm Cement Plaster 1:4', aliases: ['cement', 'plaster', '1:4'] },
+  { ...initialItems[0], code: 'MC0001', description: 'Brickwork in Cement Mortar 1:6', unit: 'cu.m', aliases: ['brickwork', 'brick', 'masonry', '1:6'], materials: [['cement', 0.95], ['sand', 0.25], ['brick', 500]], labour: [['mason', 1.2], ['helper', 1.5]], machinery: [] },
+  { ...initialItems[0], code: 'EW0005', description: 'Excavation in Foundation Trenches', unit: 'cu.m', aliases: ['excavation', 'foundation', 'trench'], materials: [], labour: [['helper', 0.7]], machinery: [['excavator', 0.08]] },
+].map((item) => ({ ...item, aliases: item.aliases || item.description.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 2) }));
 const money = (value) => `Nu. ${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const pct = (value) => `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
 
 function normalized(value) { return String(value || '').trim().toLowerCase(); }
 
-function matchRecipe(description) {
+function matchRecipe(description, code) {
+  const codeMatch = standardRecipes.find((recipe) => normalized(recipe.code) === normalized(code));
+  if (codeMatch) return codeMatch;
   const text = normalized(description);
-  return standardRecipes.find((recipe) => recipe.aliases.filter((word) => text.includes(word)).length >= Math.min(2, recipe.aliases.length));
+  return standardRecipes
+    .map((recipe) => ({ recipe, score: recipe.aliases.filter((word) => text.includes(normalized(word))).length }))
+    .sort((left, right) => right.score - left.score)
+    .find(({ score }) => score >= 2)?.recipe;
 }
 
 function importedRows(workbook) {
@@ -33,9 +46,13 @@ function importedRows(workbook) {
   return records.map((record, index) => {
     const keys = Object.keys(record);
     const valueFor = (names) => { const key = keys.find((candidate) => names.some((name) => normalized(candidate).includes(name))); return record[key]; };
+    const code = valueFor(['code', 'bsr code', 'pmc code', 'item no', 'item number', 'sr no']) || `IMP${String(index + 1).padStart(4, '0')}`;
     const description = valueFor(['description', 'item description', 'particular', 'scope', 'item']) || `Imported item ${index + 1}`;
-    const recipe = matchRecipe(description);
-    return { ...(recipe || { materials: [], labour: [], machinery: [] }), code: valueFor(['code', 'item no', 'item number', 'sr no']) || `IMP${String(index + 1).padStart(4, '0')}`, description: String(description), unit: valueFor(['unit', 'uom']) || recipe?.unit || 'unit', quantity: Number(valueFor(['quantity', 'qty', 'nos']) || 1), imported: true, matched: Boolean(recipe), needsDiscovery: !recipe };
+    const recipe = matchRecipe(description, code);
+    const uploadedRate = Number(valueFor(['unit rate', 'rate', 'bsr rate', 'amount per unit', 'basic rate']));
+    const fallbackId = `boq-rate-${index}`;
+    const fallback = Number.isFinite(uploadedRate) && uploadedRate > 0 ? { materials: [[fallbackId, 1]], labour: [], machinery: [] } : { materials: [], labour: [], machinery: [] };
+    return { ...(recipe || fallback), code: String(code), description: String(description), unit: valueFor(['unit', 'uom']) || recipe?.unit || 'unit', quantity: Number(valueFor(['quantity', 'qty', 'nos']) || 1), imported: true, matched: Boolean(recipe), needsDiscovery: !recipe && !(uploadedRate > 0), rateSource: recipe ? 'BSR/LMC coefficient' : uploadedRate > 0 ? 'BOQ uploaded rate' : 'Unresolved', fallbackId, uploadedRate };
   }).filter((item) => item.description);
 }
 
@@ -49,7 +66,7 @@ function App() {
   const calculate = (item, type) => { const resources = [...item.materials, ...item.labour, ...item.machinery]; const direct = resources.reduce((sum, [id, coefficient]) => { const row = findRate(id); return sum + Number(coefficient) * Number(row?.[type] || 0); }, 0); const rate = direct * (1 + wastage / 100) * (1 + (waterOn ? water : 0) / 100) * (1 + ohp / 100) * locations[location] * (1 + tax / 100); return { direct, rate, amount: rate * Number(item.quantity || 0) }; };
   const rows = useMemo(() => items.filter((item) => `${item.code} ${item.description}`.toLowerCase().includes(search.toLowerCase())).map((item) => ({ ...item, bsr: calculate(item, 'bsr'), market: calculate(item, 'market') })), [items, search, location, ohp, wastage, water, waterOn, tax, materials, labour, machinery]);
   const totals = rows.reduce((sum, row) => ({ bsr: sum.bsr + row.bsr.amount, market: sum.market + row.market.amount }), { bsr: 0, market: 0 }); const variance = totals.market - totals.bsr;
-  const updateRate = (setter, id, value) => setter((prev) => prev.map((row) => row.id === id ? { ...row, market: Number(value) } : row));
+  const updateRate = (setter, id, key, value) => setter((prev) => prev.map((row) => row.id === id ? { ...row, [key]: Math.max(0, Number(value)) } : row));
   const discoverUnmatched = async (imported) => {
     const unmatched = imported.filter((item) => item.needsDiscovery);
     if (!unmatched.length) return imported;
@@ -71,7 +88,7 @@ function App() {
   const uploadBoq = async (event) => {
     const file = event.target.files?.[0]; if (!file) return;
     setUploadError(''); setUploadStatus(`Reading ${file.name}...`); setDiscoveryStatus('');
-    try { const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' }); const imported = importedRows(workbook); if (!imported.length) throw new Error('No BOQ rows found. Include Description and Quantity columns.'); const resolved = await discoverUnmatched(imported); setItems(resolved); setActiveView('dashboard'); setUploadStatus(`${resolved.length} BOQ item${resolved.length === 1 ? '' : 's'} imported from ${file.name}.`); } catch (error) { setUploadError(error.message || 'Could not read this BOQ file.'); setUploadStatus(''); }
+    try { const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' }); const imported = importedRows(workbook); if (!imported.length) throw new Error('No BOQ rows found. Include Description and Quantity columns.'); const resolved = await discoverUnmatched(imported); const uploadedRateRows = resolved.filter((item) => item.uploadedRate > 0).map((item) => ({ id: item.fallbackId, name: `${item.description} uploaded unit rate`, unit: item.unit, bsr: item.uploadedRate, market: item.uploadedRate, source: 'BOQ uploaded rate' })); if (uploadedRateRows.length) setMaterials((prev) => [...prev.filter((row) => !uploadedRateRows.some((candidate) => candidate.id === row.id)), ...uploadedRateRows]); setItems(resolved); setActiveView('dashboard'); setUploadStatus(`${resolved.length} BOQ item${resolved.length === 1 ? '' : 's'} imported from ${file.name}.`); } catch (error) { setUploadError(error.message || 'Could not read this BOQ file.'); setUploadStatus(''); }
     event.target.value = '';
   };
   const exportCsv = () => { const data = rows.map((row) => ({ Code: row.code, Description: row.description, Unit: row.unit, Quantity: row.quantity, 'BSR Cost (Nu.)': row.bsr.amount.toFixed(2), 'Market Cost (Nu.)': row.market.amount.toFixed(2), 'Variance (Nu.)': (row.market.amount - row.bsr.amount).toFixed(2), 'Variance (%)': (((row.market.amount - row.bsr.amount) / row.bsr.amount) * 100).toFixed(2) })); const sheet = XLSX.utils.json_to_sheet(data); const workbook = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(workbook, sheet, 'BOQ Summary'); saveAs(new Blob([XLSX.write(workbook, { bookType: 'csv', type: 'array' })], { type: 'text/csv;charset=utf-8' }), 'druk-boq-summary.csv'); };
@@ -80,6 +97,6 @@ function App() {
 }
 function Metric({ label, value, detail, tone }) { return <div className={`metric ${tone}`}><span className="metric-line"></span><small>{label}</small><strong>{value}</strong><em>{detail}</em></div>; }
 function Setting({ label, value, setValue, suffix, toggle, setToggle }) { return <div className="setting"><label>{label}{toggle !== undefined && <button className={`toggle ${toggle ? 'on' : ''}`} onClick={() => setToggle(!toggle)}><span></span></button>}</label><div><input type="number" min="0" max={label.includes('Overhead') ? 15 : 100} value={value} onChange={(e) => setValue(Math.max(0, Number(e.target.value)))} /><span>{suffix}</span></div></div>; }
-function Library({ library, updateRate, setters }) { return <section className="panel library-panel"><div className="panel-head"><div><div className="eyebrow">MASTER DATABASE</div><h2>Basic rates library</h2><p className="muted">Edit prevailing market prices while keeping the BSR benchmark intact.</p></div><span className="library-count">{library.length} resources</span></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Resource</th><th>Unit</th><th>BSR rate (Nu.)</th><th>Market rate (Nu.)</th></tr></thead><tbody>{library.map((row) => <tr key={row.id}><td><span className={`class-tag ${row.category.toLowerCase()}`}>{row.category}</span></td><td><strong>{row.name}</strong>{row.code && <small className="row-note">{row.code}</small>}</td><td>{row.unit}</td><td>{money(row.bsr)}</td><td><input className="rate-input" type="number" value={row.market} onChange={(e) => updateRate(setters[row.category], row.id, e.target.value)} /></td></tr>)}</tbody></table></div></section>; }
+function Library({ library, updateRate, setters }) { return <section className="panel library-panel"><div className="panel-head"><div><div className="eyebrow">MASTER DATABASE</div><h2>Basic rates library</h2><p className="muted">Edit BSR, LMC, or market rates anytime. All BOQ totals recalculate instantly.</p></div><span className="library-count">{library.length} resources</span></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Resource</th><th>Unit</th><th>BSR / LMC rate (Nu.)</th><th>Market rate (Nu.)</th></tr></thead><tbody>{library.map((row) => <tr key={row.id}><td><span className={`class-tag ${row.category.toLowerCase()}`}>{row.category}</span></td><td><strong>{row.name}</strong>{row.code && <small className="row-note">{row.code}</small>}</td><td>{row.unit}</td><td><input className="rate-input" type="number" min="0" value={row.bsr} onChange={(e) => updateRate(setters[row.category], row.id, 'bsr', e.target.value)} /></td><td><input className="rate-input" type="number" min="0" value={row.market} onChange={(e) => updateRate(setters[row.category], row.id, 'market', e.target.value)} /></td></tr>)}</tbody></table></div></section>; }
 function Reports({ rows, totals, variance, exportCsv }) { return <section className="reports-grid"><div className="panel report-card"><div className="eyebrow">EXPORT CENTER</div><h2>Project outputs</h2><p className="muted">Generate the current BOQ summary for tender review or site execution.</p><button className="button primary wide" onClick={exportCsv}>Download Excel-compatible CSV</button><button className="button secondary wide" onClick={() => window.print()}>Open print-ready PDF view</button></div><div className="panel report-card"><div className="eyebrow">ABSTRACT</div><h2>Estimate snapshot</h2><div className="report-stat"><span>BSR total</span><strong>{money(totals.bsr)}</strong></div><div className="report-stat"><span>Market total</span><strong>{money(totals.market)}</strong></div><div className="report-stat"><span>Variance</span><strong className={variance > 0 ? 'text-red' : 'text-green'}>{money(variance)}</strong></div><small className="muted">{rows.length} items included in export.</small></div></section>; }
 export default App;
